@@ -12,6 +12,9 @@
 
 using namespace std;
 
+// ─────────────────────────────────────────────────────────
+//  IR Definition
+// ─────────────────────────────────────────────────────────
 enum Opcode {
     IR_NOP,
     IR_ADD,
@@ -37,17 +40,25 @@ struct IRInst {
     bool     block_end;
 };
 
+// ─────────────────────────────────────────────────────────
+//  Global State
+// ─────────────────────────────────────────────────────────
 static map<uint64_t, string> symbol_table;
 static set<uint64_t>         taint_addresses;
 
+// All dangerous source functions
 static const set<string> taint_funcs = {
     "strcpy","gets","memcpy","sprintf","strcat","scanf",
     "strncpy","strncat","vsprintf","read","fgets","sscanf"
 };
 
+// Taint state (used during analysis)
 static set<int>     tainted_registers;
 static set<int64_t> tainted_stack_offsets;
 
+// ─────────────────────────────────────────────────────────
+//  Mach-O Structures
+// ─────────────────────────────────────────────────────────
 #define MH_MAGIC_64   0xfeedfacf
 #define LC_SEGMENT_64 0x19
 #define LC_SYMTAB     0x2
@@ -123,6 +134,8 @@ struct nlist_64 {
     uint64_t n_value;
 };
 
+// dysymtab — gives us the indirect symbol table,
+// which maps __stubs slots → symtab indices → names
 struct dysymtab_command {
     uint32_t cmd;
     uint32_t cmdsize;
@@ -138,16 +151,17 @@ struct dysymtab_command {
     uint32_t nmodtab;
     uint32_t extrefsymoff;
     uint32_t nextrefsyms;
-    uint32_t indirectsymoff;   
-
-    uint32_t nindirectsyms;    
-
+    uint32_t indirectsymoff;   // ← file offset of indirect symbol table
+    uint32_t nindirectsyms;    // ← number of entries
     uint32_t extreloff;
     uint32_t nextrel;
     uint32_t locreloff;
     uint32_t nlocrel;
 };
 
+// ─────────────────────────────────────────────────────────
+//  Capstone
+// ─────────────────────────────────────────────────────────
 #ifdef __has_include
   #if __has_include(<capstone/capstone.h>) || \
       __has_include("/opt/homebrew/include/capstone/capstone.h")
@@ -189,6 +203,9 @@ struct IRInst lift_one(const cs_insn &insn);
 static int regmap(unsigned) { return -1; }
 #endif
 
+// ─────────────────────────────────────────────────────────
+//  Symbol Table Parser
+// ─────────────────────────────────────────────────────────
 void parse_symbol_table(ifstream& file, const symtab_command& st) {
     vector<char> strtab(st.strsize);
     file.seekg(st.stroff);
@@ -214,6 +231,9 @@ void parse_symbol_table(ifstream& file, const symtab_command& st) {
     cout << "[+] Loaded " << st.nsyms << " symbols from symbol table." << endl;
 }
 
+// ─────────────────────────────────────────────────────────
+//  IR Lift (single instruction)
+// ─────────────────────────────────────────────────────────
 #ifdef HAVE_CAPSTONE
 IRInst lift_one(const cs_insn &insn) {
     IRInst inst{};
@@ -252,6 +272,7 @@ IRInst lift_one(const cs_insn &insn) {
             inst.src2 = regmap(ops[2].reg);
     }
 
+    // Resolve BL targets
     if (inst.op == IR_BL) {
         uint64_t target = 0;
         if (insn.detail && insn.detail->arm64.op_count > 0 &&
@@ -272,6 +293,9 @@ IRInst lift_one(const cs_insn &insn) {
 }
 #endif
 
+// ─────────────────────────────────────────────────────────
+//  Disassembler
+// ─────────────────────────────────────────────────────────
 #ifdef HAVE_CAPSTONE
 vector<IRInst> disassemble_text_section(const vector<uint8_t>& code, uint64_t address) {
     vector<IRInst> irlist;
@@ -313,6 +337,9 @@ vector<IRInst> disassemble_text_section(const vector<uint8_t>&, uint64_t) {
 }
 #endif
 
+// ─────────────────────────────────────────────────────────
+//  IR Printer
+// ─────────────────────────────────────────────────────────
 void print_ir(const vector<IRInst>& ir) {
     cout << "\n[+] IR listing (simple)" << endl;
     cout << "Addr        | Op    | dst src1 src2 imm" << endl;
@@ -326,6 +353,15 @@ void print_ir(const vector<IRInst>& ir) {
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  WEEK 9 FIX: Full Taint Analysis
+//  Fixes:
+//    1. All taint_funcs mark X0 as tainted (not just "gets")
+//    2. STR now correctly taints stack when src register (not dst) is tainted
+//    3. Taint spreads through src2 as well as src1
+//    4. SUB propagates taint (same as ADD)
+//    5. Pointer-passed-to-taint-func marks X0 tainted (e.g. strcpy dest)
+// ─────────────────────────────────────────────────────────
 void run_taint_analysis(const vector<IRInst>& ir) {
     cout << "\n[+] Taint Analysis — tracking " << ir.size() << " instructions." << endl;
     cout << "------------------------------------------------------------" << endl;
@@ -339,17 +375,19 @@ void run_taint_analysis(const vector<IRInst>& ir) {
         bool   activity = false;
         string log;
 
+        // ── TAINT SOURCE: any dangerous library call ──────────────────
         if (inst.op == IR_BL) {
             uint64_t target = (uint64_t)inst.imm;
             string   name;
             auto it = symbol_table.find(target);
             if (it != symbol_table.end()) name = it->second;
 
+            // Check symbol table or taint_addresses set
             bool is_taint_source = taint_funcs.count(name) ||
                                    taint_addresses.count(target);
 
             if (is_taint_source) {
-
+                // X0 is the return value / first arg buffer (e.g. gets(buf) → buf tainted)
                 tainted_registers.insert(0);
                 activity = true;
                 log = "SOURCE: call to [" + (name.empty() ? "0x" + to_string(target) : name)
@@ -357,8 +395,12 @@ void run_taint_analysis(const vector<IRInst>& ir) {
             }
         }
 
+        // ── TAINT PROPAGATION ─────────────────────────────────────────
         switch (inst.op) {
 
+            // STR: str src_reg, [base, #offset]
+            // In Capstone lift: dst = src register, src1 = base register, imm = offset
+            // FIX: was using inst.dst (wrong) — should check inst.dst for taint
             case IR_STR:
                 if (tainted_registers.count(inst.dst)) {
                     tainted_stack_offsets.insert(inst.imm);
@@ -368,6 +410,7 @@ void run_taint_analysis(const vector<IRInst>& ir) {
                 }
                 break;
 
+            // LDR: ldr dst_reg, [base, #offset]
             case IR_LDR:
                 if (tainted_stack_offsets.count(inst.imm)) {
                     tainted_registers.insert(inst.dst);
@@ -377,6 +420,7 @@ void run_taint_analysis(const vector<IRInst>& ir) {
                 }
                 break;
 
+            // MOV / ADD / SUB: taint spreads from either source operand
             case IR_MOV:
             case IR_ADD:
             case IR_SUB:  // FIX: SUB was missing
@@ -393,6 +437,7 @@ void run_taint_analysis(const vector<IRInst>& ir) {
                 }
                 break;
 
+            // SINK: return with tainted X0 → likely info-leak or controlled return
             case IR_RET:
                 if (tainted_registers.count(0)) {
                     found_sink = true;
@@ -401,6 +446,8 @@ void run_taint_analysis(const vector<IRInst>& ir) {
                 }
                 break;
 
+            // Generic instruction: if memory operand's base is tainted,
+            // the result register is tainted
             case IR_OTHER:
                 if (inst.src1 >= 0 && tainted_registers.count(inst.src1)) {
                     if (inst.dst >= 0) {
@@ -426,14 +473,20 @@ void run_taint_analysis(const vector<IRInst>& ir) {
         cout << "[OK] No critical sink reached by tainted data." << endl;
 }
 
+// ─────────────────────────────────────────────────────────
+//  WEEK 10: ROP Gadget Scanner
+//  Scans IR for sequences ending in RET and classifies them
+//  by utility category (ARM64 ABI aware).
+// ─────────────────────────────────────────────────────────
+
 struct RopGadget {
     uint64_t        start_addr;
-    vector<uint64_t> insn_addrs;  
-
+    vector<uint64_t> insn_addrs;  // addresses of instructions in gadget
     string          category;
     string          description;
 };
 
+// Classify a gadget window (instructions from start to RET inclusive)
 static string classify_gadget(const vector<IRInst>& window) {
     bool loads_x0  = false, loads_x1  = false, loads_x2  = false;
     bool pops_sp   = false;
@@ -441,12 +494,12 @@ static string classify_gadget(const vector<IRInst>& window) {
     bool has_arith = false;
 
     for (const auto& i : window) {
-
+        // Loading a value into argument registers (pop-style: ldr xN, [sp, #off])
         if (i.op == IR_LDR) {
             if (i.dst == 0)  loads_x0 = true;
             if (i.dst == 1)  loads_x1 = true;
             if (i.dst == 2)  loads_x2 = true;
-
+            // Stack pivot: ldr x29/x30 from sp area
             if (i.dst == 29 || i.dst == 30) pops_sp = true;
         }
         if (i.op == IR_STR)  has_store = true;
@@ -470,8 +523,11 @@ vector<RopGadget> scan_rop_gadgets(const vector<IRInst>& ir,
     for (size_t i = 0; i < ir.size(); ++i) {
         if (ir[i].op != IR_RET) continue;
 
+        // Walk backwards up to max_window instructions
         size_t start = (i >= max_window) ? (i - max_window) : 0;
 
+        // Build a window (exclude the RET itself for classification,
+        // include it for the address list)
         vector<IRInst> window(ir.begin() + start, ir.begin() + i);
 
         RopGadget g;
@@ -498,6 +554,7 @@ void print_rop_gadgets(const vector<RopGadget>& gadgets) {
         return;
     }
 
+    // Group by category for a clean summary
     map<string, vector<const RopGadget*>> by_cat;
     for (const auto& g : gadgets)
         by_cat[g.category].push_back(&g);
@@ -515,6 +572,7 @@ void print_rop_gadgets(const vector<RopGadget>& gadgets) {
         }
     }
 
+    // Highlight dangerous categories
     cout << "\n  [!] Dangerous gadget categories detected:" << endl;
     for (const auto& [cat, list] : by_cat) {
         if (cat == "STACK_PIVOT" || cat == "LOAD_ARG_X0" ||
@@ -525,7 +583,18 @@ void print_rop_gadgets(const vector<RopGadget>& gadgets) {
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  WEEK 11: False-Positive Reduction
+//  Heuristics applied after taint analysis to filter out
+//  common patterns that are not real vulnerabilities.
+// ─────────────────────────────────────────────────────────
+
+// Returns true if the tainted sink is likely a false positive
 bool is_false_positive(const vector<IRInst>& ir) {
+    // Heuristic 1: If the only taint source is a bounded function (fgets, strncpy)
+    // AND there is an immediately preceding sub/add on sp that looks like
+    // a fixed-size allocation, the overflow may be impossible.
+    // (Simplified: flag if strncpy/fgets is the ONLY source and no RET sink found)
 
     bool has_bounded_source   = false;
     bool has_unbounded_source = false;
@@ -545,12 +614,14 @@ bool is_false_positive(const vector<IRInst>& ir) {
             has_ret_sink = true;
     }
 
+    // If only bounded sources, no unchecked sink: likely safe
     if (has_bounded_source && !has_unbounded_source && !has_ret_sink)
         return true;
 
     return false;
 }
 
+// Consolidate and print a final verdict
 void print_analysis_verdict(const vector<IRInst>& ir,
                              const vector<RopGadget>& gadgets) {
     cout << "\n=========================================================" << endl;
@@ -587,6 +658,20 @@ void print_analysis_verdict(const vector<IRInst>& ir,
     cout << "=========================================================" << endl;
 }
 
+// ─────────────────────────────────────────────────────────
+//  Stub Resolver
+//  Uses LC_DYSYMTAB's indirect symbol table to map every
+//  __stubs slot to its symbol name — no hardcoding needed.
+//
+//  How it works:
+//    1. Each entry in __stubs is exactly 3 ARM64 instructions = 12 bytes.
+//    2. section_64.reserved1 for __stubs holds the first index into the
+//       indirect symbol table for that section.
+//    3. indirect_sym_table[reserved1 + slot_index] → index into symtab.
+//    4. symtab[index].n_un.n_strx → name in string table.
+//    5. stub_addr = __stubs.addr + slot_index * 12
+//    → symbol_table[stub_addr] = resolved_name
+// ─────────────────────────────────────────────────────────
 void resolve_stubs(ifstream& file,
                    const dysymtab_command& dysym,
                    const symtab_command&   symtab_cmd,
@@ -596,15 +681,18 @@ void resolve_stubs(ifstream& file,
 {
     if (stubs_num_slots == 0) return;
 
+    // Read the full indirect symbol table (array of uint32_t indices)
     vector<uint32_t> indirect(dysym.nindirectsyms);
     file.seekg(dysym.indirectsymoff);
     file.read(reinterpret_cast<char*>(indirect.data()),
               dysym.nindirectsyms * sizeof(uint32_t));
 
+    // Read the string table
     vector<char> strtab(symtab_cmd.strsize);
     file.seekg(symtab_cmd.stroff);
     file.read(strtab.data(), symtab_cmd.strsize);
 
+    // Read the symbol table entries
     vector<nlist_64> syms(symtab_cmd.nsyms);
     file.seekg(symtab_cmd.symoff);
     file.read(reinterpret_cast<char*>(syms.data()),
@@ -612,14 +700,13 @@ void resolve_stubs(ifstream& file,
 
     cout << "\n[+] Resolving " << stubs_num_slots << " stub(s)..." << endl;
 
-    const uint64_t STUB_STRIDE = 12; 
-
+    const uint64_t STUB_STRIDE = 12; // 3 × 4-byte ARM64 instructions
     for (uint32_t slot = 0; slot < stubs_num_slots; ++slot) {
         uint32_t indirect_idx = stubs_first_indirect_idx + slot;
         if (indirect_idx >= dysym.nindirectsyms) continue;
 
         uint32_t sym_idx = indirect[indirect_idx];
-
+        // Special sentinel values defined by the Mach-O ABI
         if (sym_idx == 0x80000000 || sym_idx == 0x40000000) continue;
         if (sym_idx >= symtab_cmd.nsyms) continue;
 
@@ -644,6 +731,9 @@ void resolve_stubs(ifstream& file,
     }
 }
 
+// ─────────────────────────────────────────────────────────
+//  Main
+// ─────────────────────────────────────────────────────────
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         cerr << "Usage: " << argv[0] << " <path_to_macho_binary>" << endl;
@@ -667,6 +757,7 @@ int main(int argc, char* argv[]) {
     cout << "--- Mach-O Header Parsed ---" << endl;
     cout << "Number of Load Commands: " << header.ncmds << endl;
 
+    // ── Section locations we need to collect ─────────────────
     uint64_t text_offset = 0, text_size = 0, text_addr = 0;
     bool     found_text  = false;
 
@@ -680,6 +771,7 @@ int main(int argc, char* argv[]) {
     bool has_symtab  = false;
     bool has_dysymtab = false;
 
+    // ── First pass: collect all load commands ─────────────────
     for (uint32_t i = 0; i < header.ncmds; ++i) {
         streampos cur = file.tellg();
         load_command lc;
@@ -700,7 +792,7 @@ int main(int argc, char* argv[]) {
                     text_addr   = sect.addr;
                     found_text  = true;
                 }
-
+                // __stubs: each slot = 12 bytes; reserved1 = first indirect sym index
                 if (strcmp(sect.sectname, "__stubs") == 0) {
                     stubs_addr            = sect.addr;
                     stubs_first_indirect  = sect.reserved1;
@@ -723,9 +815,11 @@ int main(int argc, char* argv[]) {
         file.seekg(cur + (streampos)lc.cmdsize);
     }
 
+    // ── Parse symbol table (names + addresses for defined syms) ──
     if (has_symtab)
         parse_symbol_table(file, symtab_cmd);
 
+    // ── Resolve __stubs → names via LC_DYSYMTAB ──────────────────
     if (found_stubs && has_symtab && has_dysymtab) {
         resolve_stubs(file, dysym_cmd, symtab_cmd,
                       stubs_addr, stubs_first_indirect, stubs_num_slots);
@@ -739,6 +833,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // ── Disassemble + lift ────────────────────────────────────────
     file.seekg(text_offset);
     vector<uint8_t> buffer(text_size);
     file.read(reinterpret_cast<char*>(buffer.data()), text_size);
@@ -746,6 +841,7 @@ int main(int argc, char* argv[]) {
     vector<IRInst> ir = disassemble_text_section(buffer, text_addr);
     print_ir(ir);
 
+    // ── Phase 3: Analysis ─────────────────────────────────────────
     run_taint_analysis(ir);
 
     vector<RopGadget> gadgets = scan_rop_gadgets(ir);

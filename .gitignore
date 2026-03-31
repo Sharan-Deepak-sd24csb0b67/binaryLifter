@@ -1,0 +1,10 @@
+.DS_Store
+*.dSYM/
+a.out
+lifter
+parser
+vuln*
+target
+tainttest
+week*test
+.target.c.swp
